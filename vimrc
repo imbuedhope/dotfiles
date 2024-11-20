@@ -44,6 +44,12 @@ filetype plugin indent on    " required
 " see :h vundle for more details or wiki for FAQ
 " Put your non-Plugin stuff after this line
 
+fun! TrimWhitespace()
+    let l:save = winsaveview()
+    keeppatterns %s/\s\+$//e
+    call winrestview(l:save)
+endfun
+
 set relativenumber
 set expandtab
 set tabstop=4
@@ -51,4 +57,11 @@ set shiftwidth=4
 
 syntax on
 set backspace=indent,eol,start
+
+highlight ExtraWhitespace ctermbg=red guibg=red
+match ExtraWhitespace /\s\+$/
+
+if &filetype != 'markdown'
+    autocmd BufWritePre * call TrimWhitespace()
+endif
 
