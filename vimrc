@@ -11,6 +11,7 @@ call vundle#begin()
 Plugin 'VundleVim/Vundle.vim'
 
 Plugin 'git@github.com:ycm-core/YouCompleteMe.git'
+Plugin 'git@github.com:rhysd/vim-clang-format.git'
 
 " The following are examples of different formats supported.
 " Keep Plugin commands between vundle#begin/end.
@@ -44,6 +45,9 @@ filetype plugin indent on    " required
 " see :h vundle for more details or wiki for FAQ
 " Put your non-Plugin stuff after this line
 
+let g:clang_format#auto_format=1
+let g:clang_format#detect_style_file=1
+
 fun! TrimWhitespace()
     let l:save = winsaveview()
     keeppatterns %s/\s\+$//e
@@ -54,6 +58,7 @@ set relativenumber
 set expandtab
 set tabstop=4
 set shiftwidth=4
+set colorcolumn=128
 
 syntax on
 set backspace=indent,eol,start
