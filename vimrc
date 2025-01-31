@@ -55,6 +55,7 @@ fun! TrimWhitespace()
 endfun
 
 set relativenumber
+set number
 set expandtab
 set tabstop=4
 set shiftwidth=4
