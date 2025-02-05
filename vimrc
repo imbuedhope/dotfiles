@@ -12,6 +12,7 @@ Plugin 'VundleVim/Vundle.vim'
 
 Plugin 'git@github.com:ycm-core/YouCompleteMe.git'
 Plugin 'git@github.com:rhysd/vim-clang-format.git'
+Plugin 'git@github.com:tpope/vim-fugitive.git'
 
 " The following are examples of different formats supported.
 " Keep Plugin commands between vundle#begin/end.
