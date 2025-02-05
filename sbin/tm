@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""
+tm: A trash‐based “rm” replacement for Linux (Freedesktop trash spec compliant)
+
+By default, running:
+    tm file1 file2 ...
+
+will “move” the file(s) to the user’s trash (usually at ~/.local/share/Trash).
+Additional subcommands allow you to list trashed items, restore them, or empty the trash.
+See the Freedesktop Trash Specification: https://cgit.freedesktop.org/xdg/xdg-specs/plain/trash/trash-spec.xml
+and the rm man page for option ideas: https://www.man7.org/linux/man-pages/man1/rm.1.html
+
+https://chatgpt.com/share/67a2bb8e-f800-8012-a16e-0c5f0c9aed8a
+"""
+
+import os
+import sys
+import shutil
+import argparse
+import datetime
+import configparser
+from urllib.parse import quote, unquote
+
+def get_trash_dir():
+    """
+    Returns the trash directory according to the XDG spec.
+    If $XDG_DATA_HOME is set, then $XDG_DATA_HOME/Trash is used;
+    otherwise, ~/.local/share/Trash is used.
+    """
+    data_home = os.environ.get("XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share"))
+    return os.path.join(data_home, "Trash")
+
+def ensure_trash_dirs():
+    """
+    Ensures that the trash directory and its subdirectories exist.
+    Returns (files_dir, info_dir) where trashed files and metadata are stored.
+    """
+    trash_dir = get_trash_dir()
+    files_dir = os.path.join(trash_dir, "files")
+    info_dir = os.path.join(trash_dir, "info")
+    os.makedirs(files_dir, exist_ok=True)
+    os.makedirs(info_dir, exist_ok=True)
+    return files_dir, info_dir
+
+def unique_trash_name(name, files_dir):
+    """
+    Returns a unique file name for the trashed file inside files_dir.
+    If “name” already exists, a numeric suffix is appended (e.g. "foo (2).txt").
+    """
+    candidate = name
+    if not os.path.exists(os.path.join(files_dir, candidate)):
+        return candidate
+    base, ext = os.path.splitext(name)
+    i = 2
+    while os.path.exists(os.path.join(files_dir, f"{base} ({i}){ext}")):
+        i += 1
+    return f"{base} ({i}){ext}"
+
+def trash_move(files, force=False, recursive=False):
+    """
+    Implements the default “move” command. For every file given, if it exists
+    (or force is given) it is moved into the trash’s files directory, and a
+    corresponding .trashinfo file is created (with URL-encoded original path and
+    deletion date).
+    """
+    files_dir, info_dir = ensure_trash_dirs()
+    for file in files:
+        if not os.path.exists(file):
+            if force:
+                continue
+            else:
+                print(f"tm: cannot remove '{file}': No such file or directory", file=sys.stderr)
+                continue
+        if os.path.isdir(file) and not recursive:
+            print(f"tm: cannot remove '{file}': Is a directory (use -r to remove directories)", file=sys.stderr)
+            continue
+
+        # Use the absolute original path (required by the spec)
+        original_abs = os.path.abspath(file)
+        # Choose a unique name for the file in the trash
+        base_name = os.path.basename(file)
+        trash_name = unique_trash_name(base_name, files_dir)
+        dest_path = os.path.join(files_dir, trash_name)
+
+        # Create the corresponding .trashinfo file.
+        # According to the spec the .trashinfo file must have a [Trash Info] header
+        # and include the URL-encoded original file path and deletion date.
+        trashinfo_path = os.path.join(info_dir, trash_name + ".trashinfo")
+        deletion_date = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        encoded_path = quote(original_abs, safe="/")  # URL encode (keeping '/' unescaped)
+        trashinfo_content = f"[Trash Info]\nPath={encoded_path}\nDeletionDate={deletion_date}\n"
+        try:
+            with open(trashinfo_path, "w") as f:
+                f.write(trashinfo_content)
+        except Exception as e:
+            print(f"tm: error writing trash info for '{file}': {e}", file=sys.stderr)
+            continue
+
+        try:
+            shutil.move(file, dest_path)
+            print(f"tm: moved '{file}' to trash as '{trash_name}'")
+        except Exception as e:
+            print(f"tm: error moving '{file}' to trash: {e}", file=sys.stderr)
+            # Remove the .trashinfo file if the move failed.
+            try:
+                os.remove(trashinfo_path)
+            except Exception:
+                pass
+
+def trash_list():
+    """
+    Lists all trashed items by scanning the trash info directory.
+    Each trashed file’s name, original (URL-decoded) path, and deletion date is displayed.
+    """
+    files_dir, info_dir = ensure_trash_dirs()
+    trash_items = []
+    for entry in os.listdir(info_dir):
+        if entry.endswith(".trashinfo"):
+            trash_name = entry[:-10]  # remove the '.trashinfo' extension
+            info_file = os.path.join(info_dir, entry)
+            config = configparser.ConfigParser()
+            try:
+                config.read(info_file)
+                orig_path = config.get("Trash Info", "Path", fallback="unknown")
+                deletion_date = config.get("Trash Info", "DeletionDate", fallback="unknown")
+            except Exception:
+                orig_path = "unknown"
+                deletion_date = "unknown"
+            # URL-decode the original path for display
+            trash_items.append((trash_name, unquote(orig_path), deletion_date))
+    if not trash_items:
+        print("tm: trash is empty.")
+    else:
+        print("{:<4} {:<30} {:<50} {:<20}".format("No.", "Trashed Name", "Original Path", "Deletion Date"))
+        for i, (trash_name, orig_path, deletion_date) in enumerate(trash_items, 1):
+            print("{:<4} {:<30} {:<50} {:<20}".format(i, trash_name, orig_path, deletion_date))
+
+def trash_restore(names):
+    """
+    Restores one or more trashed files back to their original locations.
+    The user specifies the trash file’s name (as seen in 'tm list').
+    If the destination already exists or the original directory is missing, the restore is skipped.
+    """
+    files_dir, info_dir = ensure_trash_dirs()
+    # Build a dictionary mapping the trashed name to its info (original path, etc.)
+    trash_dict = {}
+    for entry in os.listdir(info_dir):
+        if entry.endswith(".trashinfo"):
+            trash_name = entry[:-10]
+            info_file = os.path.join(info_dir, entry)
+            config = configparser.ConfigParser()
+            try:
+                config.read(info_file)
+                orig_path = config.get("Trash Info", "Path", fallback=None)
+                if orig_path is not None:
+                    trash_dict[trash_name] = (orig_path, os.path.join(files_dir, trash_name), info_file)
+            except Exception:
+                continue
+
+    for name in names:
+        if name not in trash_dict:
+            print(f"tm: no trashed file named '{name}'", file=sys.stderr)
+            continue
+        orig_path_encoded, trashed_file_path, info_file_path = trash_dict[name]
+        orig_path = unquote(orig_path_encoded)
+        orig_dir = os.path.dirname(orig_path)
+        if not os.path.exists(orig_dir):
+            print(f"tm: original directory '{orig_dir}' does not exist. Skipping restoration for '{name}'.", file=sys.stderr)
+            continue
+        if os.path.exists(orig_path):
+            print(f"tm: cannot restore '{name}': destination '{orig_path}' already exists.", file=sys.stderr)
+            continue
+        try:
+            shutil.move(trashed_file_path, orig_path)
+            os.remove(info_file_path)
+            print(f"tm: restored '{name}' to '{orig_path}'")
+        except Exception as e:
+            print(f"tm: error restoring '{name}': {e}", file=sys.stderr)
+
+def trash_empty(force=False):
+    """
+    Empties the trash permanently.
+    If not run with --force, the user is prompted for confirmation.
+    """
+    files_dir, info_dir = ensure_trash_dirs()
+    if not force:
+        confirm = input("tm: This will permanently delete all trashed files. Are you sure? [y/N] ")
+        if confirm.lower() != "y":
+            print("tm: Aborted emptying trash.")
+            return
+    # Remove all files in the trash's "files" and "info" directories.
+    for entry in os.listdir(files_dir):
+        path = os.path.join(files_dir, entry)
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+        except Exception as e:
+            print(f"tm: error removing '{path}': {e}", file=sys.stderr)
+    for entry in os.listdir(info_dir):
+        path = os.path.join(info_dir, entry)
+        try:
+            os.remove(path)
+        except Exception as e:
+            print(f"tm: error removing '{path}': {e}", file=sys.stderr)
+    print("tm: Trash emptied.")
+
+def main():
+    # Prioritize file/folder removal over subcommand if the first argument
+    # matches one of the reserved subcommand names but also exists as a file or directory.
+    valid_commands = {"move", "list", "restore", "empty"}
+    if len(sys.argv) > 1:
+        first_arg = sys.argv[1]
+        # If the first argument is one of the reserved commands...
+        if first_arg in valid_commands:
+            # ...and it exists as a file/directory, assume removal was intended.
+            if os.path.exists(first_arg):
+                sys.argv.insert(1, "move")
+        else:
+            # If the first argument is not reserved, treat it as a file to remove.
+            sys.argv.insert(1, "move")
+
+    parser = argparse.ArgumentParser(
+        prog="tm",
+        description="Trash Manager: a safe 'rm' replacement that moves files to trash per the Freedesktop spec."
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Subcommands")
+
+    # The "move" subcommand (mimicking rm's file removal)
+    move_parser = subparsers.add_parser("move", help="move files to trash (default behavior)")
+    move_parser.add_argument("files", nargs="+", help="files to move to trash")
+    move_parser.add_argument("-f", "--force", action="store_true", help="ignore nonexistent files")
+    move_parser.add_argument("-r", "--recursive", action="store_true", help="remove directories and their contents recursively")
+
+    # The "list" subcommand
+    subparsers.add_parser("list", help="list trashed files")
+
+    # The "restore" subcommand
+    restore_parser = subparsers.add_parser("restore", help="restore trashed files")
+    restore_parser.add_argument("names", nargs="+", help="names of trashed files to restore (as listed by 'tm list')")
+
+    # The "empty" subcommand
+    empty_parser = subparsers.add_parser("empty", help="empty the trash (permanently delete all trashed files)")
+    empty_parser.add_argument("-f", "--force", action="store_true", help="do not prompt for confirmation")
+
+    args = parser.parse_args()
+
+    if args.command == "move":
+        trash_move(args.files, force=args.force, recursive=args.recursive)
+    elif args.command == "list":
+        trash_list()
+    elif args.command == "restore":
+        trash_restore(args.names)
+    elif args.command == "empty":
+        trash_empty(force=args.force)
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
+
