@@ -1,2 +1,4 @@
 [alias]
-    graph = log --graph --oneline
+    graph = log --graph --oneline --all
+[init]
+	defaultBranch = main
