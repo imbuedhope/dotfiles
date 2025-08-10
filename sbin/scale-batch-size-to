@@ -1,56 +1,55 @@
 #!/usr/bin/env python3
 """
-scale_to.py
+scale-batch-size-to
 
 Usage:
-  ./scale_to.py <current_global_batch>
+  scale-batch-size-to <current_global_batch>
 
 Assumptions:
-- Your training is using ALL visible GPUs.
-- The <current_global_batch> is GLOBAL across GPUs (DP-style).
-- Memory scales ~linearly with batch until near OOM.
-- We’ll sum per-GPU compute-app memory if available; otherwise fall back to total used.
-- No external deps; uses only nvidia-smi + stdlib.
+- All visible GPUs are in use and <current_global_batch> is GLOBAL across them.
+- VRAM ~ linear with per-GPU batch until near OOM.
+- No extra deps; only nvidia-smi + stdlib.
 
-Tweak via env vars (optional):
-  SCALE_OVERHEAD_MIB=512      # static per-GPU overhead to ignore
-  SCALE_SAFETY_PCT=0.10       # hold back % of total VRAM
-  SCALE_SAFETY_MIB=1024       # absolute minimum safety reserve
-  SCALE_RECOMMEND_SLACK=0.10  # % below computed max for "recommended"
+Env tweaks (optional):
+  SCALE_OVERHEAD_MIB=512       # static per-GPU overhead to ignore
+  SCALE_SAFETY_PCT=0.10        # hold back % of total VRAM
+  SCALE_SAFETY_MIB=1024        # absolute minimum reserve
+  SCALE_RECOMMEND_SLACK=0.10   # % below computed max for "recommended"
+  SCALE_SAMPLES=15             # number of samples
+  SCALE_INTERVAL_SEC=0.8       # seconds between samples
+  SCALE_MAD_K=3.0              # outlier threshold (k * MAD)
+  SCALE_WIDE=1                 # force wide output even on small terminals
 """
 
-import os, sys, shutil, subprocess, xml.etree.ElementTree as ET
+import os, sys, shutil, subprocess, time, xml.etree.ElementTree as ET
+import statistics as stats
 
 OVERHEAD = int(os.getenv("SCALE_OVERHEAD_MIB", 512))
 SAFETY_PCT = float(os.getenv("SCALE_SAFETY_PCT", 0.10))
 SAFETY_MIB = int(os.getenv("SCALE_SAFETY_MIB", 1024))
-RECOMM_SLACK = float(os.getenv("SCALE_RECOMMEND_SLACK", 0.10))
+RECOMM_SLACK = float(os.getenv("SCALE_RECOMM_SLACK", 0.10))
+SAMPLES = int(os.getenv("SCALE_SAMPLES", 15))
+INTERVAL = float(os.getenv("SCALE_INTERVAL_SEC", 0.8))
+MAD_K = float(os.getenv("SCALE_MAD_K", 3.0))
+SPINNER = "|/-\\"
 
 def run(cmd):
     return subprocess.run(cmd, check=True, text=True, capture_output=True).stdout.strip()
 
 def need(cond, msg, code=2):
     if not cond:
-        print(msg, file=sys.stderr)
-        sys.exit(code)
+        print(msg, file=sys.stderr); sys.exit(code)
 
 def list_gpus():
-    # index, uuid, total_mib, used_mib
     out = run(["nvidia-smi","--query-gpu=index,uuid,memory.total,memory.used","--format=csv,noheader,nounits"])
     gpus=[]
     for line in out.splitlines():
         parts=[p.strip() for p in line.split(",")]
         if len(parts)>=4:
-            gpus.append({
-                "index": int(parts[0]),
-                "uuid": parts[1],
-                "total": int(parts[2]),
-                "used":  int(parts[3]),
-            })
+            gpus.append({"index": int(parts[0]), "uuid": parts[1], "total": int(parts[2]), "used": int(parts[3])})
     return sorted(gpus, key=lambda g:g["index"])
 
 def per_gpu_compute_mem():
-    # Sum used_memory of all compute apps per GPU UUID (may be empty on some drivers)
     try:
         out = run(["nvidia-smi","--query-compute-apps=gpu_uuid,used_memory","--format=csv,noheader,nounits"])
     except subprocess.CalledProcessError:
@@ -60,15 +59,12 @@ def per_gpu_compute_mem():
         parts=[p.strip() for p in line.split(",")]
         if len(parts)==2:
             uuid, mib = parts[0], parts[1]
-            try:
-                mib = int(mib)
-            except:
-                continue
+            try: mib = int(mib)
+            except: continue
             agg[uuid] = agg.get(uuid, 0) + mib
     return agg
 
 def xml_process_fallback():
-    # If compute-apps not supported, try XML to sum all process mem per GPU.
     try:
         out = run(["nvidia-smi","-x","-q"])
     except subprocess.CalledProcessError:
@@ -86,81 +82,148 @@ def xml_process_fallback():
             agg[u]=total
     return agg
 
+def filter_outliers_mad(xs, k=MAD_K):
+    if not xs: return xs
+    med = stats.median(xs)
+    deviations = [abs(x - med) for x in xs]
+    mad = stats.median(deviations)
+    if mad == 0:
+        if len(xs) < 4:  # not enough to form quartiles
+            return xs
+        q1, q3 = stats.quantiles(xs, n=4)[0], stats.quantiles(xs, n=4)[2]
+        iqr = q3 - q1
+        if iqr == 0: return xs
+        low, high = q1 - 1.5*iqr, q3 + 1.5*iqr
+        filtered = [x for x in xs if (x >= low and x <= high)]
+    else:
+        thresh = k * 1.4826 * mad  # ~σ
+        filtered = [x for x in xs if abs(x - med) <= thresh]
+    # keep some robustness but avoid dropping almost everything
+    if len(filtered) < max(3, len(xs)//3):
+        return xs
+    return filtered
+
+def fmt_gib(mib):
+    return mib / 1024.0
+
+def build_progress_line(i, total, gcur, cols):
+    # Try full per-GPU; if too wide, fall back to compact max/avg view.
+    tokens = [f"{g['index']}:{fmt_gib(g['used']):.1f}G" for g in gcur]
+    line = f"[{i}/{total}] {SPINNER[i % len(SPINNER)]} | used→ " + " ".join(tokens)
+    if len(line) > cols - 1:
+        mx = max(gcur, key=lambda g: g["used"])
+        avg = sum(g["used"] for g in gcur) / len(gcur)
+        line = (f"[{i}/{total}] {SPINNER[i % len(SPINNER)]} | "
+                f"max {fmt_gib(mx['used']):.1f}G (GPU{mx['index']})  "
+                f"avg {fmt_gib(avg):.1f}G")
+    return (line[:cols-1])  # hard trim just in case
+
 def main():
     need(shutil.which("nvidia-smi"), "nvidia-smi not found in PATH")
-    need(len(sys.argv)==2 and sys.argv[1].isdigit(), "Usage: ./scale_to.py <current_global_batch>")
-    current_global = int(sys.argv[1])
-    need(current_global>0, "Batch must be > 0")
+    # one-arg interface
+    if len(sys.argv) != 2 or not sys.argv[1].isdigit():
+        print("Usage: scale-batch-size-to <current_global_batch>", file=sys.stderr); sys.exit(2)
+    current_global = int(sys.argv[1]); need(current_global>0, "Batch must be > 0")
 
-    gpus = list_gpus()
-    need(gpus, "No GPUs found by nvidia-smi")
-
+    gpus = list_gpus(); need(gpus, "No GPUs found by nvidia-smi")
     num = len(gpus)
-    per_gpu_batch = max(1, current_global // num)  # floor split
+    per_gpu_batch = max(1, current_global // num)
     remainder = current_global % num
 
-    # Prefer compute-app sums; fallback to XML; else use total used.
-    per_uuid = per_gpu_compute_mem()
-    if not per_uuid:
-        per_uuid = xml_process_fallback()
+    cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+    wide = (cols >= 100) or (os.getenv("SCALE_WIDE", "0") == "1")
 
-    results=[]
+    # Collect time series per GPU
+    series = {g["index"]: {"used_total": [], "proc_used": []} for g in gpus}
+
+    print(f"Sampling nvidia-smi {SAMPLES}x every {INTERVAL:.1f}s ...")
+    for i in range(1, SAMPLES+1):
+        try:
+            per_uuid = per_gpu_compute_mem() or xml_process_fallback()
+        except Exception:
+            per_uuid = {}
+        gcur = list_gpus()
+        for g in gcur:
+            idx = g["index"]
+            series[idx]["used_total"].append(g["used"])
+            series[idx]["proc_used"].append(per_uuid.get(g["uuid"], 0))
+        line = build_progress_line(i, SAMPLES, gcur, cols)
+        sys.stdout.write("\r" + line)
+        sys.stdout.flush()
+        if i != SAMPLES:
+            time.sleep(INTERVAL)
+    print("\nProcessing samples (robust to outliers)...")
+
+    results = []
     for g in gpus:
-        total = g["total"]
-        used_total = g["used"]
-        proc_used = per_uuid.get(g["uuid"], 0)
+        idx, total = g["index"], g["total"]
+        used_f = filter_outliers_mad(series[idx]["used_total"])
+        proc_f = filter_outliers_mad(series[idx]["proc_used"])
+        med_used = int(round(stats.median(used_f))) if used_f else g["used"]
+        med_proc = int(round(stats.median(proc_f))) if proc_f else 0
 
-        # pick the best signal for training footprint
-        if proc_used > 0:
-            dynamic = max(1, proc_used - OVERHEAD)
-            source = "compute-apps"
+        # Choose source for dynamic memory
+        if med_proc > 0:
+            dynamic_base, source = med_proc, "compute-apps"
         else:
-            dynamic = max(1, used_total - OVERHEAD)
-            source = "gpu-used"
+            dynamic_base, source = med_used, "gpu-used"
 
+        dynamic = max(1, dynamic_base - OVERHEAD)
         mem_per_sample = max(1.0, dynamic / float(per_gpu_batch))
+
         safety_reserve = max(int(total * SAFETY_PCT), SAFETY_MIB)
-        headroom = max(0, (total - used_total) - safety_reserve)
+        headroom = max(0, (total - med_used) - safety_reserve)
 
         additional = int(headroom // mem_per_sample)
-        new_max_pg = per_gpu_batch + additional
-        rec_pg = max(per_gpu_batch, int(new_max_pg * (1.0 - RECOMM_SLACK)))
+        max_pg = per_gpu_batch + additional
+        rec_pg = max(per_gpu_batch, int(max_pg * (1.0 - RECOMM_SLACK)))
 
         results.append({
-            "idx": g["index"],
-            "total": total,
-            "used_total": used_total,
-            "proc_used": proc_used,
-            "source": source,
-            "per_sample": mem_per_sample,
-            "headroom": headroom,
-            "max_pg": new_max_pg,
-            "rec_pg": rec_pg,
+            "idx": idx, "total": total, "med_used": med_used, "med_proc": med_proc,
+            "source": source, "per_sample": mem_per_sample, "headroom": headroom,
+            "max_pg": max_pg, "rec_pg": rec_pg,
+            "dropped_used": len(series[idx]["used_total"]) - len(used_f),
+            "dropped_proc": len(series[idx]["proc_used"]) - len(proc_f),
         })
 
     # Bottleneck GPU limits the per-GPU batch; convert back to global
-    bottleneck_max_pg = min(r["max_pg"] for r in results)
+    bottleneck = min(results, key=lambda r: r["max_pg"])
+    bottleneck_max_pg = bottleneck["max_pg"]
     bottleneck_rec_pg = min(r["rec_pg"] for r in results)
     max_global = bottleneck_max_pg * num
     rec_global = bottleneck_rec_pg * num
 
-    # Pretty print
-    print("=== GPU Batch Scaling Estimate ===")
+    # Header
+    print("=== GPU Batch Scaling Estimate (robust) ===")
     print(f"Visible GPUs: {num}")
     print(f"Current global batch: {current_global}  (≈ per-GPU {per_gpu_batch}"
           + (f" with remainder {remainder}" if remainder else "") + ")")
     print(f"Overhead={OVERHEAD} MiB, Safety={int(SAFETY_PCT*100)}% or {SAFETY_MIB} MiB, Recommend slack={int(RECOMM_SLACK*100)}%")
     print()
-    for r in results:
-        print(f"GPU {r['idx']}: total={r['total']} MiB, used={r['used_total']} MiB, "
-              f"compute_used={r['proc_used']} MiB[{r['source']}], "
-              f"~{r['per_sample']:.1f} MiB/sample, headroom≈{r['headroom']} MiB → "
-              f"max per-GPU={r['max_pg']}  rec per-GPU={r['rec_pg']}")
+
+    # Compact per-GPU rows
+    for r in sorted(results, key=lambda x: x["idx"]):
+        used_g = fmt_gib(r["med_used"]); tot_g = fmt_gib(r["total"]); head_g = fmt_gib(r["headroom"])
+        pct = (r["med_used"]/r["total"]*100.0) if r["total"] else 0.0
+        if wide:
+            row = (f"GPU {r['idx']}: used {used_g:.1f}/{tot_g:.0f}G ({pct:.0f}%), "
+                   f"head {head_g:.1f}G, ~{r['per_sample']:.0f} MiB/S → "
+                   f"max {r['max_pg']}  rec {r['rec_pg']}  "
+                   f"(drop used {r['dropped_used']}/{SAMPLES}, proc {r['dropped_proc']}/{SAMPLES})")
+        else:
+            row = (f"GPU {r['idx']}: {used_g:.1f}/{tot_g:.0f}G, head {head_g:.1f}G → "
+                   f"max {r['max_pg']}  rec {r['rec_pg']}")
+        # hard trim to terminal width
+        if len(row) > cols - 1:
+            row = row[:cols-2]
+        print(row)
+
+    # Summary
     print("\n== Summary (global batch) ==")
+    print(f"Bottleneck GPU: {bottleneck['idx']}  (max per-GPU {bottleneck_max_pg}, rec per-GPU {bottleneck_rec_pg})")
     print(f"Max safe global batch: {max_global}")
     print(f"Recommended global batch: {rec_global}")
-    step = num
-    print(f"\nTip: Increase in steps of {step} (one sample per GPU).")
+    print(f"\nTip: Increase in steps of {num} (one sample per GPU).")
 
 if __name__ == "__main__":
     main()
