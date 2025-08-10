@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""
+scale_to.py
+
+Usage:
+  ./scale_to.py <current_global_batch>
+
+Assumptions:
+- Your training is using ALL visible GPUs.
+- The <current_global_batch> is GLOBAL across GPUs (DP-style).
+- Memory scales ~linearly with batch until near OOM.
+- We’ll sum per-GPU compute-app memory if available; otherwise fall back to total used.
+- No external deps; uses only nvidia-smi + stdlib.
+
+Tweak via env vars (optional):
+  SCALE_OVERHEAD_MIB=512      # static per-GPU overhead to ignore
+  SCALE_SAFETY_PCT=0.10       # hold back % of total VRAM
+  SCALE_SAFETY_MIB=1024       # absolute minimum safety reserve
+  SCALE_RECOMMEND_SLACK=0.10  # % below computed max for "recommended"
+"""
+
+import os, sys, shutil, subprocess, xml.etree.ElementTree as ET
+
+OVERHEAD = int(os.getenv("SCALE_OVERHEAD_MIB", 512))
+SAFETY_PCT = float(os.getenv("SCALE_SAFETY_PCT", 0.10))
+SAFETY_MIB = int(os.getenv("SCALE_SAFETY_MIB", 1024))
+RECOMM_SLACK = float(os.getenv("SCALE_RECOMMEND_SLACK", 0.10))
+
+def run(cmd):
+    return subprocess.run(cmd, check=True, text=True, capture_output=True).stdout.strip()
+
+def need(cond, msg, code=2):
+    if not cond:
+        print(msg, file=sys.stderr)
+        sys.exit(code)
+
+def list_gpus():
+    # index, uuid, total_mib, used_mib
+    out = run(["nvidia-smi","--query-gpu=index,uuid,memory.total,memory.used","--format=csv,noheader,nounits"])
+    gpus=[]
+    for line in out.splitlines():
+        parts=[p.strip() for p in line.split(",")]
+        if len(parts)>=4:
+            gpus.append({
+                "index": int(parts[0]),
+                "uuid": parts[1],
+                "total": int(parts[2]),
+                "used":  int(parts[3]),
+            })
+    return sorted(gpus, key=lambda g:g["index"])
+
+def per_gpu_compute_mem():
+    # Sum used_memory of all compute apps per GPU UUID (may be empty on some drivers)
+    try:
+        out = run(["nvidia-smi","--query-compute-apps=gpu_uuid,used_memory","--format=csv,noheader,nounits"])
+    except subprocess.CalledProcessError:
+        return {}
+    agg={}
+    for line in out.splitlines():
+        parts=[p.strip() for p in line.split(",")]
+        if len(parts)==2:
+            uuid, mib = parts[0], parts[1]
+            try:
+                mib = int(mib)
+            except:
+                continue
+            agg[uuid] = agg.get(uuid, 0) + mib
+    return agg
+
+def xml_process_fallback():
+    # If compute-apps not supported, try XML to sum all process mem per GPU.
+    try:
+        out = run(["nvidia-smi","-x","-q"])
+    except subprocess.CalledProcessError:
+        return {}
+    root = ET.fromstring(out)
+    agg={}
+    for gpu in root.findall("gpu"):
+        u = gpu.findtext("uuid", "").strip()
+        total=0
+        for p in gpu.findall("./processes/process_info"):
+            m = p.findtext("used_memory", "").strip().split()
+            if m and m[0].isdigit():
+                total += int(m[0])
+        if u and total>0:
+            agg[u]=total
+    return agg
+
+def main():
+    need(shutil.which("nvidia-smi"), "nvidia-smi not found in PATH")
+    need(len(sys.argv)==2 and sys.argv[1].isdigit(), "Usage: ./scale_to.py <current_global_batch>")
+    current_global = int(sys.argv[1])
+    need(current_global>0, "Batch must be > 0")
+
+    gpus = list_gpus()
+    need(gpus, "No GPUs found by nvidia-smi")
+
+    num = len(gpus)
+    per_gpu_batch = max(1, current_global // num)  # floor split
+    remainder = current_global % num
+
+    # Prefer compute-app sums; fallback to XML; else use total used.
+    per_uuid = per_gpu_compute_mem()
+    if not per_uuid:
+        per_uuid = xml_process_fallback()
+
+    results=[]
+    for g in gpus:
+        total = g["total"]
+        used_total = g["used"]
+        proc_used = per_uuid.get(g["uuid"], 0)
+
+        # pick the best signal for training footprint
+        if proc_used > 0:
+            dynamic = max(1, proc_used - OVERHEAD)
+            source = "compute-apps"
+        else:
+            dynamic = max(1, used_total - OVERHEAD)
+            source = "gpu-used"
+
+        mem_per_sample = max(1.0, dynamic / float(per_gpu_batch))
+        safety_reserve = max(int(total * SAFETY_PCT), SAFETY_MIB)
+        headroom = max(0, (total - used_total) - safety_reserve)
+
+        additional = int(headroom // mem_per_sample)
+        new_max_pg = per_gpu_batch + additional
+        rec_pg = max(per_gpu_batch, int(new_max_pg * (1.0 - RECOMM_SLACK)))
+
+        results.append({
+            "idx": g["index"],
+            "total": total,
+            "used_total": used_total,
+            "proc_used": proc_used,
+            "source": source,
+            "per_sample": mem_per_sample,
+            "headroom": headroom,
+            "max_pg": new_max_pg,
+            "rec_pg": rec_pg,
+        })
+
+    # Bottleneck GPU limits the per-GPU batch; convert back to global
+    bottleneck_max_pg = min(r["max_pg"] for r in results)
+    bottleneck_rec_pg = min(r["rec_pg"] for r in results)
+    max_global = bottleneck_max_pg * num
+    rec_global = bottleneck_rec_pg * num
+
+    # Pretty print
+    print("=== GPU Batch Scaling Estimate ===")
+    print(f"Visible GPUs: {num}")
+    print(f"Current global batch: {current_global}  (≈ per-GPU {per_gpu_batch}"
+          + (f" with remainder {remainder}" if remainder else "") + ")")
+    print(f"Overhead={OVERHEAD} MiB, Safety={int(SAFETY_PCT*100)}% or {SAFETY_MIB} MiB, Recommend slack={int(RECOMM_SLACK*100)}%")
+    print()
+    for r in results:
+        print(f"GPU {r['idx']}: total={r['total']} MiB, used={r['used_total']} MiB, "
+              f"compute_used={r['proc_used']} MiB[{r['source']}], "
+              f"~{r['per_sample']:.1f} MiB/sample, headroom≈{r['headroom']} MiB → "
+              f"max per-GPU={r['max_pg']}  rec per-GPU={r['rec_pg']}")
+    print("\n== Summary (global batch) ==")
+    print(f"Max safe global batch: {max_global}")
+    print(f"Recommended global batch: {rec_global}")
+    step = num
+    print(f"\nTip: Increase in steps of {step} (one sample per GPU).")
+
+if __name__ == "__main__":
+    main()
+
