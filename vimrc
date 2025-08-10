@@ -14,6 +14,8 @@ Plugin 'git@github.com:ycm-core/YouCompleteMe.git'
 Plugin 'git@github.com:rhysd/vim-clang-format.git'
 Plugin 'git@github.com:tpope/vim-fugitive.git'
 
+Plugin 'git@github.com:psf/black.git'
+
 " The following are examples of different formats supported.
 " Keep Plugin commands between vundle#begin/end.
 " plugin on GitHub repo
@@ -71,4 +73,11 @@ match ExtraWhitespace /\s\+$/
 if &filetype != 'markdown'
     autocmd BufWritePre * call TrimWhitespace()
 endif
+
+" Python auto format with Black
+let g:black_linelength = 128
+augroup black_on_save
+  autocmd!
+  autocmd BufWritePre *.py Black
+augroup end
 
